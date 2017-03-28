@@ -10,29 +10,67 @@ from six.moves import xrange
 from ops import *
 from utils import *
 
+"""
+Function from:
+https://github.com/tensorflow/tensorflow/issues/6095
+"""
+def atan2(y, x, epsilon=1.0e-12):
+  # Add a small number to all zeros, to avoid division by zero:
+  x = tf.where(tf.equal(x, 0.0), x+epsilon, x)
+  y = tf.where(tf.equal(y, 0.0), y+epsilon, y)
+
+  angle = tf.where(tf.greater(x,0.0), tf.atan(y/x), tf.zeros_like(x))
+  angle = tf.where(tf.logical_and(tf.less(x,0.0),  tf.greater_equal(y,0.0)), tf.atan(y/x) + np.pi, angle)
+  angle = tf.where(tf.logical_and(tf.less(x,0.0),  tf.less(y,0.0)), tf.atan(y/x) - np.pi, angle)
+  angle = tf.where(tf.logical_and(tf.equal(x,0.0), tf.greater(y,0.0)), 0.5*np.pi * tf.ones_like(x), angle)
+  angle = tf.where(tf.logical_and(tf.equal(x,0.0), tf.less(y,0.0)), -0.5*np.pi * tf.ones_like(x), angle)
+  angle = tf.where(tf.logical_and(tf.equal(x,0.0), tf.equal(y,0.0)), tf.zeros_like(x), angle)
+  return angle
+
+
 def conv_out_size_same(size, stride):
   return int(math.ceil(float(size) / float(stride)))
 
 class DCGAN(object):
-  def __init__(self, sess, input_height=108, input_width=108, is_crop=True,
-         batch_size=64, sample_num = 64, output_height=64, output_width=64,
-         y_dim=None, z_dim=100, gf_dim=64, df_dim=64,
-         gfc_dim=1024, dfc_dim=1024, c_dim=3, dataset_name='default',
-         input_fname_pattern='*.jpg', checkpoint_dir=None, sample_dir=None):
-    """
+  def __init__(self, n_layers=2, batch_size=100,
+                 max_n_atoms=200, n_atom_types=25,
+                 max_valence=4,
+                 L_list = [100, 100, 100, 100],
+                 n_tasks=1,
+                 learning_rate=1e-4,
+                 beta1=0.9,
+                 beta2=0.999,
+                 epsilon=1e-7,
+                 save_path="./temp_model",
+                 dropout=1.):
 
-    Args:
-      sess: TensorFlow session
-      batch_size: The size of batch. Should be specified before training.
-      y_dim: (optional) Dimension of dim for y. [None]
-      z_dim: (optional) Dimension of dim for Z. [100]
-      gf_dim: (optional) Dimension of gen filters in first conv layer. [64]
-      df_dim: (optional) Dimension of discrim filters in first conv layer. [64]
-      gfc_dim: (optional) Dimension of gen units for for fully connected layer. [1024]
-      dfc_dim: (optional) Dimension of discrim units for fully connected layer. [1024]
-      c_dim: (optional) Dimension of image color. For grayscale input, set to 1. [3]
+    self.graph = tf.Graph()
+    self.sess = tf.Session(graph=self.graph, config=tf.ConfigProto(log_device_placement=True))
+    self.dropout = dropout
+    self.pad_batches = True
+    self.B = max_n_atoms
+    B = self.B
+    self.p = n_atom_types
+    p = self.p
+    self.V = max_valence
+    V = self.V
+    self.n_layers = n_layers
+
+    self.batch_size = batch_size
+    self.S = batch_size
+    S = self.S
+    self._save_path = save_path
+    self.n_tasks = int(n_tasks)
+    
+    self.L_list = L_list
+    self.n_layers = n_layers
+
+    self.build_model()
+
+
+
+
     """
-    self.sess = sess
     self.is_crop = is_crop
     self.is_grayscale = (c_dim == 1)
 
@@ -73,426 +111,350 @@ class DCGAN(object):
     self.input_fname_pattern = input_fname_pattern
     self.checkpoint_dir = checkpoint_dir
     self.build_model()
+    """
+
+  def construct_feed_dict(self, X, start=None,
+                          stop=None, y=None,
+                          keep_prob=1.0, train=False):
+    S = self.S
+    w_b = np.ones((self.batch_size, self.n_tasks))
+
+    if start is None:
+      start = 0
+      stop = len(X)
+
+    a = time.time()
+    adj = [X[idx][2][0].toarray().astype(np.float32) for idx in range(start, stop)]
+    A_batch = [X[idx][2][1].toarray() for idx in range(start, stop)]
+    D_batch = [X[idx][1][0] for idx in range(start, stop)]
+    y_batch = [X[idx][1][1].toarray() for idx in range(start, stop)]
+
+    a = time.time()
+    y_batch = np.squeeze(np.concatenate(y_batch))
+
+
+    a = time.time()
+    non_zero_batch = np.where(y_batch != 0.)[0]
+
+    a = time.time()
+    onehotter = OneHotEncoder(n_values = S*X[0][1][1].shape[0])
+    non_zero_onehot = onehotter.fit_transform(non_zero_batch).toarray().reshape((len(non_zero_batch),S*X[0][1][1].shape[0]))
+
+    feed_dict = {self.x: A_batch,
+                 self.adj_matrix: adj,
+                 self.weight_placeholder: w_b,
+                 self.phase: True,
+                 self.keep_prob: keep_prob,
+                 self.phase: train,
+                 self.label_placeholder: y_batch,
+                 self.non_zero_inds: non_zero_onehot,
+                 self.dihed_indices: D_batch
+                }
+    return(feed_dict)
 
   def build_model(self):
-    if self.y_dim:
-      self.y= tf.placeholder(tf.float32, [self.batch_size, self.y_dim], name='y')
+    S = self.S
+    B = self.B
+    p = self.p
+    self.keep_prob = tf.placeholder(tf.float32)
+    self.phase = tf.placeholder(dtype='bool', name='phase')
 
-    if self.is_crop:
-      image_dims = [self.output_height, self.output_width, self.c_dim]
-    else:
-      image_dims = [self.input_height, self.input_width, self.c_dim]
+    self.x = tf.placeholder(tf.float32, shape=[S, B, p])
 
-    self.inputs = tf.placeholder(
-      tf.float32, [self.batch_size] + image_dims, name='real_images')
-    self.sample_inputs = tf.placeholder(
-      tf.float32, [self.sample_num] + image_dims, name='sample_inputs')
+    self.non_zero_inds = tf.placeholder(tf.int32, shape=[None, S*250])
 
-    inputs = self.inputs
-    sample_inputs = self.sample_inputs
+    self.adj_matrix = tf.placeholder(tf.float32, shape=[S, B, B])
+    self.dihed_indices = tf.placeholder(tf.float32, shape=[S, 250, B, 4])
 
-    self.z = tf.placeholder(
-      tf.float32, [None, self.z_dim], name='z')
-    self.z_sum = histogram_summary("z", self.z)
+    self.label_placeholder = tf.placeholder(
+      dtype='float32', shape=[S*250], name="label_placeholder")
 
-    if self.y_dim:
-      self.G = self.generator(self.z, self.y)
-      self.D, self.D_logits = \
-          self.discriminator(inputs, self.y, reuse=False)
+    self.weight_placeholder = tf.placeholder(
+      dtype='float32', shape=(S, self.n_tasks), name="weight_placeholder")
 
-      self.sampler = self.sampler(self.z, self.y)
-      self.D_, self.D_logits_ = \
-          self.discriminator(self.G, self.y, reuse=True)
-    else:
-      self.G = self.generator(self.z)
-      self.D, self.D_logits = self.discriminator(inputs)
+    self.phase = tf.placeholder(dtype='bool', name='phase')
 
-      self.sampler = self.sampler(self.z)
-      self.D_, self.D_logits_ = self.discriminator(self.G, reuse=True)
+    self.z = tf.placeholder(tf.float32,
+                            [None, self.L_list[0]], name='z')
 
-    self.d_sum = histogram_summary("d", self.D)
-    self.d__sum = histogram_summary("d_", self.D_)
-    self.G_sum = image_summary("G", self.G)
+    self.G = self.generator()
+    self.D_logits = self.discriminator(reuse=False)
+    #self.sampler = self.sampler()
+    self.D_logits_ = self.discriminator(reuse=True)
 
-    def sigmoid_cross_entropy_with_logits(x, y):
-      try:
-        return tf.nn.sigmoid_cross_entropy_with_logits(logits=x, labels=y)
-      except:
-        return tf.nn.sigmoid_cross_entropy_with_logits(logits=x, targets=y)
+    self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(self.D_logits, tf.ones_like(self.D)))
+    self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(self.D_logits_, tf.zeros_like(self.D_)))
+    self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(self.D_logits_, tf.ones_like(self.D_)))
 
-    self.d_loss_real = tf.reduce_mean(
-      sigmoid_cross_entropy_with_logits(self.D_logits, tf.ones_like(self.D)))
-    self.d_loss_fake = tf.reduce_mean(
-      sigmoid_cross_entropy_with_logits(self.D_logits_, tf.zeros_like(self.D_)))
-    self.g_loss = tf.reduce_mean(
-      sigmoid_cross_entropy_with_logits(self.D_logits_, tf.ones_like(self.D_)))
-
-    self.d_loss_real_sum = scalar_summary("d_loss_real", self.d_loss_real)
-    self.d_loss_fake_sum = scalar_summary("d_loss_fake", self.d_loss_fake)
-                          
     self.d_loss = self.d_loss_real + self.d_loss_fake
-
-    self.g_loss_sum = scalar_summary("g_loss", self.g_loss)
-    self.d_loss_sum = scalar_summary("d_loss", self.d_loss)
 
     t_vars = tf.trainable_variables()
 
     self.d_vars = [var for var in t_vars if 'd_' in var.name]
     self.g_vars = [var for var in t_vars if 'g_' in var.name]
 
-    self.saver = tf.train.Saver()
 
-  def train(self, config):
+  def train(self, train_dataset, config):
     """Train DCGAN"""
-    if config.dataset == 'mnist':
-      data_X, data_y = self.load_mnist()
-    else:
-      data = glob(os.path.join("./data", config.dataset, self.input_fname_pattern))
     #np.random.shuffle(data)
 
-    d_optim = tf.train.AdamOptimizer(config.learning_rate, beta1=config.beta1) \
-              .minimize(self.d_loss, var_list=self.d_vars)
-    g_optim = tf.train.AdamOptimizer(config.learning_rate, beta1=config.beta1) \
-              .minimize(self.g_loss, var_list=self.g_vars)
+    d_optim = tf.train.AdamOptimizer(self.learning_rate, beta1=self.beta1).minimize(self.d_loss, var_list=self.d_vars)
+    g_optim = tf.train.AdamOptimizer(self.learning_rate, beta1=self.beta1).minimize(self.g_loss, var_list=self.g_vars)
     try:
       tf.global_variables_initializer().run()
     except:
       tf.initialize_all_variables().run()
 
-    self.g_sum = merge_summary([self.z_sum, self.d__sum,
-      self.G_sum, self.d_loss_fake_sum, self.g_loss_sum])
-    self.d_sum = merge_summary(
-        [self.z_sum, self.d_sum, self.d_loss_real_sum, self.d_loss_sum])
-    self.writer = SummaryWriter("./logs", self.sess.graph)
+    n_train = len(train_dataset)
+    S = self.S
 
-    sample_z = np.random.uniform(-1, 1, size=(self.sample_num , self.z_dim))
-    
-    if config.dataset == 'mnist':
-      sample_inputs = data_X[0:self.sample_num]
-      sample_labels = data_y[0:self.sample_num]
-    else:
-      sample_files = data[0:self.sample_num]
-      sample = [
-          get_image(sample_file,
-                    input_height=self.input_height,
-                    input_width=self.input_width,
-                    resize_height=self.output_height,
-                    resize_width=self.output_width,
-                    is_crop=self.is_crop,
-                    is_grayscale=self.is_grayscale) for sample_file in sample_files]
-      if (self.is_grayscale):
-        sample_inputs = np.array(sample).astype(np.float32)[:, :, :, None]
-      else:
-        sample_inputs = np.array(sample).astype(np.float32)
-  
-    counter = 1
-    start_time = time.time()
-    could_load, checkpoint_counter = self.load(self.checkpoint_dir)
-    if could_load:
-      counter = checkpoint_counter
-      print(" [*] Load SUCCESS")
-    else:
-      print(" [!] Load failed...")
+    for i in range(0,n_epochs):
+      if i % 1 == 0:
+        print("Training epoch %d" %i)
+      batch_sched = list(range(0, n_train+1,S))
+      t = time.time()
+      for j in range(0, len(batch_sched)-1):
+        print(j)
+        start = batch_sched[j]
+        stop = batch_sched[j+1]
+        a = time.time()
+        feed_dict = self.construct_feed_dict(train_dataset, start, stop)
 
-    for epoch in xrange(config.epoch):
-      if config.dataset == 'mnist':
-        batch_idxs = min(len(data_X), config.train_size) // config.batch_size
-      else:      
-        data = glob(os.path.join(
-          "./data", config.dataset, self.input_fname_pattern))
-        batch_idxs = min(len(data), config.train_size) // config.batch_size
+        self.sess.run(d_optim, feed_dict=feed_dict)
+        self.sess.run(g_optim, feed_dict=feed_dict)
+        self.sess.run(g_optim, feed_dict=feed_dict)
+        
+        errD_fake = self.sess.run(self.d_loss_fake, feed_dict=feed_dict)
+        errD_real = self.sess.run(self.d_loss_real, feed_dict=feed_dict)
+        errG = self.sess.run(self.g_loss, feed_dict=feed_dict)
 
-      for idx in xrange(0, batch_idxs):
-        if config.dataset == 'mnist':
-          batch_images = data_X[idx*config.batch_size:(idx+1)*config.batch_size]
-          batch_labels = data_y[idx*config.batch_size:(idx+1)*config.batch_size]
-        else:
-          batch_files = data[idx*config.batch_size:(idx+1)*config.batch_size]
-          batch = [
-              get_image(batch_file,
-                        input_height=self.input_height,
-                        input_width=self.input_width,
-                        resize_height=self.output_height,
-                        resize_width=self.output_width,
-                        is_crop=self.is_crop,
-                        is_grayscale=self.is_grayscale) for batch_file in batch_files]
-          if (self.is_grayscale):
-            batch_images = np.array(batch).astype(np.float32)[:, :, :, None]
-          else:
-            batch_images = np.array(batch).astype(np.float32)
+        print(errD_fake)
+        print(errD_real)
+        print(errG)
 
-        batch_z = np.random.uniform(-1, 1, [config.batch_size, self.z_dim]) \
-              .astype(np.float32)
-
-        if config.dataset == 'mnist':
-          # Update D network
-          _, summary_str = self.sess.run([d_optim, self.d_sum],
-            feed_dict={ 
-              self.inputs: batch_images,
-              self.z: batch_z,
-              self.y:batch_labels,
-            })
-          self.writer.add_summary(summary_str, counter)
-
-          # Update G network
-          _, summary_str = self.sess.run([g_optim, self.g_sum],
-            feed_dict={
-              self.z: batch_z, 
-              self.y:batch_labels,
-            })
-          self.writer.add_summary(summary_str, counter)
-
-          # Run g_optim twice to make sure that d_loss does not go to zero (different from paper)
-          _, summary_str = self.sess.run([g_optim, self.g_sum],
-            feed_dict={ self.z: batch_z, self.y:batch_labels })
-          self.writer.add_summary(summary_str, counter)
-          
-          errD_fake = self.d_loss_fake.eval({
-              self.z: batch_z, 
-              self.y:batch_labels
-          })
-          errD_real = self.d_loss_real.eval({
-              self.inputs: batch_images,
-              self.y:batch_labels
-          })
-          errG = self.g_loss.eval({
-              self.z: batch_z,
-              self.y: batch_labels
-          })
-        else:
-          # Update D network
-          _, summary_str = self.sess.run([d_optim, self.d_sum],
-            feed_dict={ self.inputs: batch_images, self.z: batch_z })
-          self.writer.add_summary(summary_str, counter)
-
-          # Update G network
-          _, summary_str = self.sess.run([g_optim, self.g_sum],
-            feed_dict={ self.z: batch_z })
-          self.writer.add_summary(summary_str, counter)
-
-          # Run g_optim twice to make sure that d_loss does not go to zero (different from paper)
-          _, summary_str = self.sess.run([g_optim, self.g_sum],
-            feed_dict={ self.z: batch_z })
-          self.writer.add_summary(summary_str, counter)
-          
-          errD_fake = self.d_loss_fake.eval({ self.z: batch_z })
-          errD_real = self.d_loss_real.eval({ self.inputs: batch_images })
-          errG = self.g_loss.eval({self.z: batch_z})
-
-        counter += 1
-        print("Epoch: [%2d] [%4d/%4d] time: %4.4f, d_loss: %.8f, g_loss: %.8f" \
-          % (epoch, idx, batch_idxs,
-            time.time() - start_time, errD_fake+errD_real, errG))
-
-        if np.mod(counter, 100) == 1:
-          if config.dataset == 'mnist':
-            samples, d_loss, g_loss = self.sess.run(
-              [self.sampler, self.d_loss, self.g_loss],
-              feed_dict={
-                  self.z: sample_z,
-                  self.inputs: sample_inputs,
-                  self.y:sample_labels,
-              }
-            )
-            save_images(samples, [8, 8],
-                  './{}/train_{:02d}_{:04d}.png'.format(config.sample_dir, epoch, idx))
-            print("[Sample] d_loss: %.8f, g_loss: %.8f" % (d_loss, g_loss)) 
-          else:
-            try:
-              samples, d_loss, g_loss = self.sess.run(
-                [self.sampler, self.d_loss, self.g_loss],
-                feed_dict={
-                    self.z: sample_z,
-                    self.inputs: sample_inputs,
-                },
-              )
-              save_images(samples, [8, 8],
-                    './{}/train_{:02d}_{:04d}.png'.format(config.sample_dir, epoch, idx))
-              print("[Sample] d_loss: %.8f, g_loss: %.8f" % (d_loss, g_loss)) 
-            except:
-              print("one pic error!...")
-
-        if np.mod(counter, 500) == 2:
-          self.save(config.checkpoint_dir, counter)
-
-  def discriminator(self, image, y=None, reuse=False):
+  def discriminator(self, reuse):
+    n_layers = self.n_layers
+    S = self.S
+    B = self.B
+    L_list = self.L_list
     with tf.variable_scope("discriminator") as scope:
       if reuse:
         scope.reuse_variables()
 
-      if not self.y_dim:
-        h0 = lrelu(conv2d(image, self.df_dim, name='d_h0_conv'))
-        h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim*2, name='d_h1_conv')))
-        h2 = lrelu(self.d_bn2(conv2d(h1, self.df_dim*4, name='d_h2_conv')))
-        h3 = lrelu(self.d_bn3(conv2d(h2, self.df_dim*8, name='d_h3_conv')))
-        h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h3_lin')
+        W_list = [None for i in range(n_layers)]
+        b_list = [None for i in range(n_layers)]
+        h_list = [None for i in range(n_layers)]
 
-        return tf.nn.sigmoid(h4), h4
-      else:
-        yb = tf.reshape(y, [self.batch_size, 1, 1, self.y_dim])
-        x = conv_cond_concat(image, yb)
+        def adjacency_conv_layer(atom_matrix, W, b, L_in, L_out, layer_idx):
+          print("layer_idx: %d" %(layer_idx))
+          h = tf.matmul(self.adj_matrix, atom_matrix)
+          h = tf.reshape(h, shape=(S*B, L_in))
 
-        h0 = lrelu(conv2d(x, self.c_dim + self.y_dim, name='d_h0_conv'))
-        h0 = conv_cond_concat(h0, yb)
+          h = tf.nn.sigmoid(tf.matmul(h, W) + b)
+          return(h)
 
-        h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim + self.y_dim, name='d_h1_conv')))
-        h1 = tf.reshape(h1, [self.batch_size, -1])      
-        h1 = concat([h1, y], 1)
-        
-        h2 = lrelu(self.d_bn2(linear(h1, self.dfc_dim, 'd_h2_lin')))
-        h2 = concat([h2, y], 1)
+        for layer_idx in range(n_layers):
+          if layer_idx == 0:
+            L_in = p
+            L_out = L_list[0]
+            atom_matrix = x
+          else:
+            L_in = L_list[layer_idx-1]
+            L_out = L_list[layer_idx]
+            atom_matrix = h_list[layer_idx-1]
 
-        h3 = linear(h2, 1, 'd_h3_lin')
-        
-        return tf.nn.sigmoid(h3), h3
+          W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out], seed=2017), name="W_list%d" %layer_idx)
+          b_list[layer_idx] = tf.Variable(tf.ones([1, L_out]))
+          h_list[layer_idx] = adjacency_conv_layer(atom_matrix, W_list[layer_idx], b_list[layer_idx], L_in, L_out, layer_idx)
 
-  def generator(self, z, y=None):
+        L_final = L_list[n_layers-1]
+        h_final = tf.reshape(h_list[-1], (S, B, L_final))
+
+        #add dihedral regressor layers
+
+        d0 = []
+        for i in range(0, S):
+          mol_tuple = []
+          for j in range(0, 4):
+            entry = h_final[i]
+            indices = self.dihed_indices[i][:,:,j]
+            atom_list = tf.matmul(indices, entry)
+            atom_list = tf.reshape(atom_list, (250, L_final))
+            mol_tuple.append(atom_list)
+          mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (250, L_final*4))
+          d0.append(mol_tuple)
+
+        d0 = tf.concat(d0, axis=0)
+
+
+        W_d0 = tf.Variable(tf.truncated_normal([L_final*4, 100]))
+        b_d0 = tf.Variable(tf.ones([1, 100]))
+        d2 = tf.nn.sigmoid(tf.matmul(d0, W_d0) + b_d0)
+
+        W_d2 = tf.Variable(tf.truncated_normal([100, 1]))
+        b_d2 = tf.Variable(tf.ones([1, 1]))
+        d3 = tf.matmul(d2, W_d2) + b_d2
+        d3_cos = tf.cos(d3)
+        d3_sin = tf.sin(d3)
+        output = atan2(d3_sin, d3_cos)
+
+        output = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), output)
+        labels = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), self.label_placeholder)
+
+        def expand_basis(angles):
+          return(tf.stack([tf.abs(angles), tf.sin(angles), tf.sin(2*angles), tf.sin(3*angles), tf.sin(4*angles), tf.sin(5*angles)]))
+
+        sq_diff = tf.square(tf.subtract(labels, output))
+
+        W_diff1 = tf.Variable(tf.truncated_normal([6, 10]))
+        b_diff1 = tf.Variable(tf.truncated_normal([1, 10]))
+        fc_diff1 = tf.nn.relu(tf.matmul(sq_diff, W_diff1) + b_diff1)
+
+        W_diff2 = tf.Variable(tf.truncated_normal([10, 1]))
+        b_diff2 = tf.Variable(tf.truncated_normal([1, 1]))
+        fc_diff2 = tf.nn.sigmoid(tf.matmul(fc_diff1, W_diff1) + b_diff1)
+
+        return(fc_diff2)
+
+  def generator(self):
+    n_layers = self.n_layers
+    S = self.S
+    B = self.B
+    L_list = self.L_list
+    p = self.p
+    x = self.x 
     with tf.variable_scope("generator") as scope:
-      if not self.y_dim:
-        s_h, s_w = self.output_height, self.output_width
-        s_h2, s_w2 = conv_out_size_same(s_h, 2), conv_out_size_same(s_w, 2)
-        s_h4, s_w4 = conv_out_size_same(s_h2, 2), conv_out_size_same(s_w2, 2)
-        s_h8, s_w8 = conv_out_size_same(s_h4, 2), conv_out_size_same(s_w4, 2)
-        s_h16, s_w16 = conv_out_size_same(s_h8, 2), conv_out_size_same(s_w8, 2)
 
-        # project `z` and reshape
-        self.z_, self.h0_w, self.h0_b = linear(
-            z, self.gf_dim*8*s_h16*s_w16, 'g_h0_lin', with_w=True)
+      W_list = [None for i in range(n_layers)]
+      b_list = [None for i in range(n_layers)]
+      h_list = [None for i in range(n_layers)]
 
-        self.h0 = tf.reshape(
-            self.z_, [-1, s_h16, s_w16, self.gf_dim * 8])
-        h0 = tf.nn.relu(self.g_bn0(self.h0))
+      def adjacency_conv_layer(atom_matrix, W, b, L_in, L_out, layer_idx):
+        print("layer_idx: %d" %(layer_idx))
+        h = tf.matmul(self.adj_matrix, atom_matrix)
+        h = tf.reshape(h, shape=(S*B, L_in))
 
-        self.h1, self.h1_w, self.h1_b = deconv2d(
-            h0, [self.batch_size, s_h8, s_w8, self.gf_dim*4], name='g_h1', with_w=True)
-        h1 = tf.nn.relu(self.g_bn1(self.h1))
+        h = tf.nn.sigmoid(tf.matmul(h, W) + b)
+        return(h)
 
-        h2, self.h2_w, self.h2_b = deconv2d(
-            h1, [self.batch_size, s_h4, s_w4, self.gf_dim*2], name='g_h2', with_w=True)
-        h2 = tf.nn.relu(self.g_bn2(h2))
+      for layer_idx in range(n_layers):
+        if layer_idx == 0:
+          L_in = p
+          L_out = L_list[0]
+          atom_matrix = x
+        else:
+          L_in = L_list[layer_idx-1]
+          L_out = L_list[layer_idx]
+          atom_matrix = h_list[layer_idx-1]
 
-        h3, self.h3_w, self.h3_b = deconv2d(
-            h2, [self.batch_size, s_h2, s_w2, self.gf_dim*1], name='g_h3', with_w=True)
-        h3 = tf.nn.relu(self.g_bn3(h3))
+        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out], seed=2017), name="W_list%d" %layer_idx)
+        b_list[layer_idx] = tf.Variable(tf.ones([1, L_out]))
+        h_list[layer_idx] = adjacency_conv_layer(atom_matrix, W_list[layer_idx], b_list[layer_idx], L_in, L_out, layer_idx)
 
-        h4, self.h4_w, self.h4_b = deconv2d(
-            h3, [self.batch_size, s_h, s_w, self.c_dim], name='g_h4', with_w=True)
+      L_final = L_list[n_layers-1]
+      h_final = tf.reshape(h_list[-1], (S, B, L_final))
 
-        return tf.nn.tanh(h4)
-      else:
-        s_h, s_w = self.output_height, self.output_width
-        s_h2, s_h4 = int(s_h/2), int(s_h/4)
-        s_w2, s_w4 = int(s_w/2), int(s_w/4)
+      #add dihedral regressor layers
 
-        # yb = tf.expand_dims(tf.expand_dims(y, 1),2)
-        yb = tf.reshape(y, [self.batch_size, 1, 1, self.y_dim])
-        z = concat([z, y], 1)
+      d0 = []
+      for i in range(0, S):
+        mol_tuple = []
+        for j in range(0, 4):
+          entry = h_final[i]
+          indices = self.dihed_indices[i][:,:,j]
+          atom_list = tf.matmul(indices, entry)
+          atom_list = tf.reshape(atom_list, (250, L_final))
+          mol_tuple.append(atom_list)
+        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (250, L_final*4))
+        d0.append(mol_tuple)
 
-        h0 = tf.nn.relu(
-            self.g_bn0(linear(z, self.gfc_dim, 'g_h0_lin')))
-        h0 = concat([h0, y], 1)
+      d0 = tf.concat(d0, axis=0)
 
-        h1 = tf.nn.relu(self.g_bn1(
-            linear(h0, self.gf_dim*2*s_h4*s_w4, 'g_h1_lin')))
-        h1 = tf.reshape(h1, [self.batch_size, s_h4, s_w4, self.gf_dim * 2])
 
-        h1 = conv_cond_concat(h1, yb)
+      W_d0 = tf.Variable(tf.truncated_normal([L_final*4, 100]))
+      b_d0 = tf.Variable(tf.ones([1, 100]))
+      d2 = tf.nn.sigmoid(tf.matmul(d0, W_d0) + b_d0)
 
-        h2 = tf.nn.relu(self.g_bn2(deconv2d(h1,
-            [self.batch_size, s_h2, s_w2, self.gf_dim * 2], name='g_h2')))
-        h2 = conv_cond_concat(h2, yb)
+      W_d2 = tf.Variable(tf.truncated_normal([100, 1]))
+      b_d2 = tf.Variable(tf.ones([1, 1]))
+      d3 = tf.matmul(d2, W_d2) + b_d2
+      d3_cos = tf.cos(d3)
+      d3_sin = tf.sin(d3)
+      output = atan2(d3_sin, d3_cos)
 
-        return tf.nn.sigmoid(
-            deconv2d(h2, [self.batch_size, s_h, s_w, self.c_dim], name='g_h3'))
+      output = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), output)
 
-  def sampler(self, z, y=None):
+      return(output)
+
+  def sampler(self, reuse):
+    n_layers = self.n_layers
+    S = self.S
+    B = self.B
+    L_list = self.L_list
     with tf.variable_scope("generator") as scope:
       scope.reuse_variables()
 
-      if not self.y_dim:
-        s_h, s_w = self.output_height, self.output_width
-        s_h2, s_w2 = conv_out_size_same(s_h, 2), conv_out_size_same(s_w, 2)
-        s_h4, s_w4 = conv_out_size_same(s_h2, 2), conv_out_size_same(s_w2, 2)
-        s_h8, s_w8 = conv_out_size_same(s_h4, 2), conv_out_size_same(s_w4, 2)
-        s_h16, s_w16 = conv_out_size_same(s_h8, 2), conv_out_size_same(s_w8, 2)
+      W_list = [None for i in range(n_layers)]
+      b_list = [None for i in range(n_layers)]
+      h_list = [None for i in range(n_layers)]
 
-        # project `z` and reshape
-        h0 = tf.reshape(
-            linear(z, self.gf_dim*8*s_h16*s_w16, 'g_h0_lin'),
-            [-1, s_h16, s_w16, self.gf_dim * 8])
-        h0 = tf.nn.relu(self.g_bn0(h0, train=False))
+      def adjacency_conv_layer(atom_matrix, W, b, L_in, L_out, layer_idx):
+        print("layer_idx: %d" %(layer_idx))
+        h = tf.matmul(self.adj_matrix, atom_matrix)
+        h = tf.reshape(h, shape=(S*B, L_in))
 
-        h1 = deconv2d(h0, [self.batch_size, s_h8, s_w8, self.gf_dim*4], name='g_h1')
-        h1 = tf.nn.relu(self.g_bn1(h1, train=False))
+        h = tf.nn.sigmoid(tf.matmul(h, W) + b)
+        return(h)
 
-        h2 = deconv2d(h1, [self.batch_size, s_h4, s_w4, self.gf_dim*2], name='g_h2')
-        h2 = tf.nn.relu(self.g_bn2(h2, train=False))
+      for layer_idx in range(n_layers):
+        if layer_idx == 0:
+          L_in = p
+          L_out = L_list[0]
+          atom_matrix = x
+        else:
+          L_in = L_list[layer_idx-1]
+          L_out = L_list[layer_idx]
+          atom_matrix = h_list[layer_idx-1]
 
-        h3 = deconv2d(h2, [self.batch_size, s_h2, s_w2, self.gf_dim*1], name='g_h3')
-        h3 = tf.nn.relu(self.g_bn3(h3, train=False))
+        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out], seed=2017), name="W_list%d" %layer_idx)
+        b_list[layer_idx] = tf.Variable(tf.ones([1, L_out]))
+        h_list[layer_idx] = adjacency_conv_layer(atom_matrix, W_list[layer_idx], b_list[layer_idx], L_in, L_out, layer_idx)
 
-        h4 = deconv2d(h3, [self.batch_size, s_h, s_w, self.c_dim], name='g_h4')
+      L_final = L_list[n_layers-1]
+      h_final = tf.reshape(h_list[-1], (S, B, L_final))
 
-        return tf.nn.tanh(h4)
-      else:
-        s_h, s_w = self.output_height, self.output_width
-        s_h2, s_h4 = int(s_h/2), int(s_h/4)
-        s_w2, s_w4 = int(s_w/2), int(s_w/4)
+      #add dihedral regressor layers
 
-        # yb = tf.reshape(y, [-1, 1, 1, self.y_dim])
-        yb = tf.reshape(y, [self.batch_size, 1, 1, self.y_dim])
-        z = concat([z, y], 1)
+      d0 = []
+      for i in range(0, S):
+        mol_tuple = []
+        for j in range(0, 4):
+          entry = h_final[i]
+          indices = self.dihed_indices[i][:,:,j]
+          atom_list = tf.matmul(indices, entry)
+          atom_list = tf.reshape(atom_list, (250, L_final))
+          mol_tuple.append(atom_list)
+        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (250, L_final*4))
+        d0.append(mol_tuple)
 
-        h0 = tf.nn.relu(self.g_bn0(linear(z, self.gfc_dim, 'g_h0_lin'), train=False))
-        h0 = concat([h0, y], 1)
+      d0 = tf.concat(d0, axis=0)
 
-        h1 = tf.nn.relu(self.g_bn1(
-            linear(h0, self.gf_dim*2*s_h4*s_w4, 'g_h1_lin'), train=False))
-        h1 = tf.reshape(h1, [self.batch_size, s_h4, s_w4, self.gf_dim * 2])
-        h1 = conv_cond_concat(h1, yb)
 
-        h2 = tf.nn.relu(self.g_bn2(
-            deconv2d(h1, [self.batch_size, s_h2, s_w2, self.gf_dim * 2], name='g_h2'), train=False))
-        h2 = conv_cond_concat(h2, yb)
+      W_d0 = tf.Variable(tf.truncated_normal([L_final*4, 100]))
+      b_d0 = tf.Variable(tf.ones([1, 100]))
+      d2 = tf.nn.sigmoid(tf.matmul(d0, W_d0) + b_d0)
 
-        return tf.nn.sigmoid(deconv2d(h2, [self.batch_size, s_h, s_w, self.c_dim], name='g_h3'))
+      W_d2 = tf.Variable(tf.truncated_normal([100, 1]))
+      b_d2 = tf.Variable(tf.ones([1, 1]))
+      d3 = tf.matmul(d2, W_d2) + b_d2
+      d3_cos = tf.cos(d3)
+      d3_sin = tf.sin(d3)
+      output = atan2(d3_sin, d3_cos)
 
-  def load_mnist(self):
-    data_dir = os.path.join("./data", self.dataset_name)
-    
-    fd = open(os.path.join(data_dir,'train-images-idx3-ubyte'))
-    loaded = np.fromfile(file=fd,dtype=np.uint8)
-    trX = loaded[16:].reshape((60000,28,28,1)).astype(np.float)
+      output = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), output)
 
-    fd = open(os.path.join(data_dir,'train-labels-idx1-ubyte'))
-    loaded = np.fromfile(file=fd,dtype=np.uint8)
-    trY = loaded[8:].reshape((60000)).astype(np.float)
+      return(output)
 
-    fd = open(os.path.join(data_dir,'t10k-images-idx3-ubyte'))
-    loaded = np.fromfile(file=fd,dtype=np.uint8)
-    teX = loaded[16:].reshape((10000,28,28,1)).astype(np.float)
-
-    fd = open(os.path.join(data_dir,'t10k-labels-idx1-ubyte'))
-    loaded = np.fromfile(file=fd,dtype=np.uint8)
-    teY = loaded[8:].reshape((10000)).astype(np.float)
-
-    trY = np.asarray(trY)
-    teY = np.asarray(teY)
-    
-    X = np.concatenate((trX, teX), axis=0)
-    y = np.concatenate((trY, teY), axis=0).astype(np.int)
-    
-    seed = 547
-    np.random.seed(seed)
-    np.random.shuffle(X)
-    np.random.seed(seed)
-    np.random.shuffle(y)
-    
-    y_vec = np.zeros((len(y), self.y_dim), dtype=np.float)
-    for i, label in enumerate(y):
-      y_vec[i,y[i]] = 1.0
-    
-    return X/255.,y_vec
 
   @property
   def model_dir(self):
