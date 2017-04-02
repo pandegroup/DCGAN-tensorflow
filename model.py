@@ -34,7 +34,7 @@ def conv_out_size_same(size, stride):
 
 class DCGAN(object):
   def __init__(self, n_layers=2, batch_size=100,
-                 max_n_atoms=200, n_atom_types=25,
+                 max_n_atoms=10000, n_atom_types=25,
                  max_valence=4,
                  L_list = [100, 100, 100, 100],
                  n_tasks=1,
@@ -48,7 +48,6 @@ class DCGAN(object):
     self.graph = tf.Graph()
     self.sess = tf.Session(graph=self.graph, config=tf.ConfigProto(log_device_placement=True))
     with self.graph.as_default():
-
       self.dropout = dropout
       self.pad_batches = True
       self.B = max_n_atoms
@@ -71,110 +70,21 @@ class DCGAN(object):
       self.learning_rate = learning_rate
       self.beta1 = beta1
 
-      self.build_model()
-
-
-
-
-    """
-    self.is_crop = is_crop
-    self.is_grayscale = (c_dim == 1)
-
-    self.batch_size = batch_size
-    self.sample_num = sample_num
-
-    self.input_height = input_height
-    self.input_width = input_width
-    self.output_height = output_height
-    self.output_width = output_width
-
-    self.y_dim = y_dim
-    self.z_dim = z_dim
-
-    self.gf_dim = gf_dim
-    self.df_dim = df_dim
-
-    self.gfc_dim = gfc_dim
-    self.dfc_dim = dfc_dim
-
-    self.c_dim = c_dim
-
-    # batch normalization : deals with poor initialization helps gradient flow
-    self.d_bn1 = batch_norm(name='d_bn1')
-    self.d_bn2 = batch_norm(name='d_bn2')
-
-    if not self.y_dim:
-      self.d_bn3 = batch_norm(name='d_bn3')
-
-    self.g_bn0 = batch_norm(name='g_bn0')
-    self.g_bn1 = batch_norm(name='g_bn1')
-    self.g_bn2 = batch_norm(name='g_bn2')
-
-    if not self.y_dim:
-      self.g_bn3 = batch_norm(name='g_bn3')
-
-    self.dataset_name = dataset_name
-    self.input_fname_pattern = input_fname_pattern
-    self.checkpoint_dir = checkpoint_dir
-    self.build_model()
-    """
-
-  def construct_feed_dict(self, X, start=None,
-                          stop=None, y=None,
-                          keep_prob=1.0, train=False):
-    S = self.S
-    w_b = np.ones((self.batch_size, self.n_tasks))
-
-    if start is None:
-      start = 0
-      stop = len(X)
-
-    a = time.time()
-    adj = [X[idx][2][0].toarray().astype(np.float32) for idx in range(start, stop)]
-    A_batch = [X[idx][2][1].toarray() for idx in range(start, stop)]
-    D_batch = [X[idx][1][0] for idx in range(start, stop)]
-    y_batch = [X[idx][1][1].toarray() for idx in range(start, stop)]
-
-    a = time.time()
-    y_batch = np.squeeze(np.concatenate(y_batch))
-
-
-    a = time.time()
-    non_zero_batch = np.where(y_batch != 0.)[0]
-
-    a = time.time()
-    onehotter = OneHotEncoder(n_values = S*X[0][1][1].shape[0])
-    non_zero_onehot = onehotter.fit_transform(non_zero_batch).toarray().reshape((len(non_zero_batch),S*X[0][1][1].shape[0]))
-
-    feed_dict = {self.x: A_batch,
-                 self.adj_matrix: adj,
-                 self.weight_placeholder: w_b,
-                 self.phase: True,
-                 self.keep_prob: keep_prob,
-                 self.phase: train,
-                 self.label_placeholder: y_batch,
-                 self.non_zero_inds: non_zero_onehot,
-                 self.dihed_indices: D_batch
-                }
-    return(feed_dict)
-
-  def build_model(self):
-    with self.graph.as_default():
       S = self.S
       B = self.B
       p = self.p
       self.keep_prob = tf.placeholder(tf.float32)
       self.phase = tf.placeholder(dtype='bool', name='phase')
 
-      self.x = tf.placeholder(tf.float32, shape=[S, B, p])
+      self.x = tf.placeholder(tf.float32, shape=[S*10000, p])
 
-      self.non_zero_inds = tf.placeholder(tf.int32, shape=[None, S*250])
+      self.non_zero_inds = tf.placeholder(tf.int32, shape=[None, S*25])
 
       self.adj_matrix = tf.placeholder(tf.float32, shape=[S, B, B])
-      self.dihed_indices = tf.placeholder(tf.float32, shape=[S, 250, B, 4])
+      self.dihed_indices = tf.placeholder(tf.float32, shape=[S, 25, B, 4])
 
       self.label_placeholder = tf.placeholder(
-        dtype='float32', shape=[S*250], name="label_placeholder")
+        dtype='float32', shape=[S*10000], name="label_placeholder")
 
       self.weight_placeholder = tf.placeholder(
         dtype='float32', shape=(S, self.n_tasks), name="weight_placeholder")
@@ -182,44 +92,70 @@ class DCGAN(object):
       self.phase = tf.placeholder(dtype='bool', name='phase')
 
       self.z = tf.placeholder(tf.float32,
-                              [None, self.L_list[0]], name='z')
+                              [S*10000, 5], name='z')
 
-      self.G = self.generator()
-      self.D_logits = self.discriminator(reuse=False)
+      self.G = self.generator(self.x, reuse=False)
+
+      self.D_logits = self.discriminator(self.label_placeholder, reuse=False)
       #self.sampler = self.sampler()
-      self.D_logits_ = self.discriminator(reuse=True)
+      self.D_logits_ = self.discriminator(self.G, reuse=True)
 
-      print("self.G")
-      print(self.G)
-      print("self.D_logits")
-      print(self.D_logits)
-      print("self.D_logits_")
-      print(self.D_logits_)
 
-      self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=self.D_logits, logits=tf.ones_like(self.D_logits)))
-      self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=self.D_logits_, logits=tf.zeros_like(self.D_logits_)))
-      self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=self.D_logits_, logits=tf.ones_like(self.D_logits_)))
+      #self.d_loss_real = tf.reduce_mean(self.D_logits)
+      #self.d_loss_fake = -1.0*tf.reduce_mean(self.D_logits_)
+      #self.g_loss = tf.reduce_mean(tf.abs(self.D_logits_))
 
-      self.d_loss = self.d_loss_real + self.d_loss_fake
+      #self.d_loss_real = tf.reduce_mean(tf.nn.log(self.D_logits))
+      #self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_, labels=tf.zeros_like(self.D_logits_)))
+      #self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_, labels=tf.ones_like(self.D_logits_)))
+
+      self.d_loss = tf.reduce_mean(-tf.log(self.D_logits)-tf.log(1-self.D_logits_))
+      self.g_loss = tf.reduce_mean(-tf.log(self.D_logits_))
 
       t_vars = tf.trainable_variables()
 
+      self.d_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='discriminator')
+      self.g_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='generator')
+
       self.d_vars = [var for var in t_vars if 'd_' in var.name]
       self.g_vars = [var for var in t_vars if 'g_' in var.name]
+
+      self.d_optim = tf.train.AdamOptimizer(self.learning_rate, beta1=self.beta1).minimize(self.d_loss, var_list=self.d_params)#, var_list=self.d_vars)
+      self.g_optim = tf.train.AdamOptimizer(self.learning_rate, beta1=self.beta1).minimize(self.g_loss, var_list=self.g_params)#, var_list=self.g_vars)
+      self.predicted = self.generator(self.x, reuse=True)
+      #self.predicted = self.sampler(self.x, self.adj_matrix, self.dihed_indices, self.non_zero_inds, self.z)
+
+      self.init_fn = tf.global_variables_initializer()
+      print(self.sess.run(self.init_fn))
+
+
+      #self.build_model()
+
+  def construct_feed_dict(self, X=None, start=None,
+                          stop=None, y=None,
+                          keep_prob=1.0, train=False):
+
+
+    x_batch = np.reshape(np.sort(np.random.uniform(-1,1, size=(1*10000, 1))), (-1,1))
+    y_batch = np.squeeze(np.sort(np.random.normal(size=(1*10000,1))))
+
+    feed_dict = {self.x: x_batch,
+                 self.label_placeholder: y_batch,
+                }
+    return(feed_dict)
+
+  def build_model(self):
+    with self.graph.as_default():
+      pass
 
 
   def train(self, train_dataset, n_epochs):
     """Train DCGAN"""
     #np.random.shuffle(data)
-    with self.graph.as_default():
-      d_optim = tf.train.AdamOptimizer(self.learning_rate, beta1=self.beta1).minimize(self.d_loss)
-      g_optim = tf.train.AdamOptimizer(self.learning_rate, beta1=self.beta1).minimize(self.g_loss)#, var_list=self.g_vars)
-      self.init_fn = tf.global_variables_initializer()
-      print(self.sess.run(self.init_fn))
 
     n_train = len(train_dataset)
     S = self.S
-
+    preds = []
     for i in range(0,n_epochs):
       if i % 1 == 0:
         print("Training epoch %d" %i)
@@ -232,50 +168,77 @@ class DCGAN(object):
         a = time.time()
         feed_dict = self.construct_feed_dict(train_dataset, start, stop)
 
-        self.sess.run(d_optim, feed_dict=feed_dict)
-        self.sess.run(g_optim, feed_dict=feed_dict)
-        self.sess.run(g_optim, feed_dict=feed_dict)
+        self.sess.run(self.d_optim, feed_dict=feed_dict)
+        self.sess.run(self.g_optim, feed_dict=feed_dict)
+        #self.sess.run(self.g_optim, feed_dict=feed_dict)
+        #print("final labels")
+        #print(self.sess.run(self.labels, feed_dict))
+        #print("reshaped labels")
+        #print(self.sess.run(self.initial_labels, feed_dict=feed_dict))
         
-        errD_fake = self.sess.run(self.d_loss_fake, feed_dict=feed_dict)
-        errD_real = self.sess.run(self.d_loss_real, feed_dict=feed_dict)
+        #errD_fake = self.sess.run(self.d_loss_fake, feed_dict=feed_dict)
+        #errD_real = self.sess.run(self.d_loss_real, feed_dict=feed_dict)
+        errD = self.sess.run(self.d_loss, feed_dict=feed_dict)
         errG = self.sess.run(self.g_loss, feed_dict=feed_dict)
 
-        print(errD_fake)
-        print(errD_real)
+        if i == n_epochs-1:
+          preds.append(self.sess.run(self.predicted, feed_dict=feed_dict))
+        #if j == 0 :
+        #  print(self.sess.run(self.G, feed_dict=feed_dict)[:3])
+
+
+
+      if i % 10 == 0:
+        print(errD)
         print(errG)
+    print(preds[0][:3])
+  def predict(self):
 
-  def predict(self, dataset):
-    n_train = len(dataset)
-    S = self.S
-
-    batch_sched = list(range(0, n_train+1,S))
-    t = time.time()
-    preds = []
-
-    with self.graph.as_default():
-      self.predicted = self.sampler()
-    for j in range(0, len(batch_sched)-1):
-      #print(j)
-      start = batch_sched[j]
-      stop = batch_sched[j+1]
-      a = time.time()
-      feed_dict = self.construct_feed_dict(dataset, start, stop)
-      preds.append(self.sess.run(self.predicted, feed_dict=feed_dict))
-
-    return(preds)
+    feed_dict = self.construct_feed_dict()
+    return(self.sess.run(self.predicted, feed_dict=feed_dict))
 
 
-  def discriminator(self, x, adj_matrix, dihed_indices, label_placeholder, non_zero_inds, reuse):
+  def discriminator(self, label_placeholder, reuse):
     n_layers = self.n_layers
     S = self.S
     B = self.B
     L_list = self.L_list
     p = self.p
-    x = self.x 
 
     with tf.variable_scope("discriminator") as scope:
       if reuse:
         scope.reuse_variables()
+
+      W0 = tf.Variable(tf.random_normal([p, 5]))
+      b0 = tf.Variable(tf.zeros([1, 5]))
+
+      y = tf.reshape(label_placeholder, (-1,1))
+      h0 = tf.nn.tanh(tf.matmul(y, W0) + b0)
+
+      #h0 = tf.add(h0, z)
+
+      W1 = tf.Variable(tf.random_normal([5, 5]))
+      b1 = tf.Variable(tf.zeros([1, 5]))
+
+      h1 = tf.nn.tanh(tf.matmul(h0, W1) + b1)
+
+      W2 = tf.Variable(tf.random_normal([5, 5]))
+      b2 = tf.Variable(tf.zeros([1, 5]))
+
+      h2 = tf.nn.tanh(tf.matmul(h1, W2) + b2)
+      #print("disc.h1")
+      #print(h1)
+
+      #return(h1)
+
+
+      W3 = tf.Variable(tf.truncated_normal([5, 1]))
+      b3 = tf.Variable(tf.ones([1, 1]))
+
+      h3 = tf.nn.sigmoid(tf.matmul(h2, W3)+b3)
+      return(h3 )
+
+      """
 
       W_list = [None for i in range(n_layers)]
       b_list = [None for i in range(n_layers)]
@@ -283,7 +246,7 @@ class DCGAN(object):
 
       def adjacency_conv_layer(atom_matrix, W, b, L_in, L_out, layer_idx):
         print("layer_idx: %d" %(layer_idx))
-        h = tf.matmul(self.adj_matrix, atom_matrix)
+        h = tf.matmul(adj_matrix, atom_matrix)
         h = tf.reshape(h, shape=(S*B, L_in))
 
         h = tf.nn.sigmoid(tf.matmul(h, W) + b)
@@ -301,7 +264,7 @@ class DCGAN(object):
           L_out = L_list[layer_idx]
           atom_matrix = h_list[layer_idx-1]
 
-        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out], seed=2017), name="W_list%d" %layer_idx)
+        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out]), name="W_list%d" %layer_idx)
         b_list[layer_idx] = tf.Variable(tf.ones([1, L_out]))
         h_list[layer_idx] = adjacency_conv_layer(atom_matrix, W_list[layer_idx], b_list[layer_idx], L_in, L_out, layer_idx)
 
@@ -315,11 +278,11 @@ class DCGAN(object):
         mol_tuple = []
         for j in range(0, 4):
           entry = h_final[i]
-          indices = self.dihed_indices[i][:,:,j]
+          indices = dihed_indices[i][:,:,j]
           atom_list = tf.matmul(indices, entry)
-          atom_list = tf.reshape(atom_list, (250, L_final))
+          atom_list = tf.reshape(atom_list, (25, L_final))
           mol_tuple.append(atom_list)
-        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (250, L_final*4))
+        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (25, L_final*4))
         d0.append(mol_tuple)
 
       d0 = tf.concat(d0, axis=0)
@@ -336,18 +299,19 @@ class DCGAN(object):
       d3_sin = tf.sin(d3)
       output = atan2(d3_sin, d3_cos)
 
-      output = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), output)
-      print("output")
-      print(output)
+      output = tf.matmul(tf.cast(non_zero_inds, tf.float32), output, name='reduce_output_nonzeros')
 
-      print("non_zero_inds")
-      print(self.non_zero_inds)
-      print("label_placeholder")
-      print(self.label_placeholder)
-      labels = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), tf.reshape(self.label_placeholder, (-1,1)))
+      reshaped_labels = tf.reshape(label_placeholder, (-1,1), name='reshaped_labels')
+      labels = tf.matmul(tf.cast(non_zero_inds, tf.float32), reshaped_labels, name='reduce_labels_nonzeros')
 
-      def expand_basis(angles):
-        return(tf.concat([tf.abs(angles), tf.sin(angles), tf.sin(2*angles), tf.sin(3*angles), tf.sin(4*angles), tf.sin(5*angles)], axis=1))
+      self.final_labels = labels
+      self.initial_labels = reshaped_labels
+
+      return(tf.abs(tf.subtract(output, labels)))
+      def expand_basis(ini_angles):
+        angles = tf.reshape(ini_angles, (-1,1))
+        return(tf.reshape(tf.stack([tf.abs(angles), tf.sin(angles), tf.sin(2*angles), tf.sin(3*angles), tf.sin(4*angles), tf.sin(5*angles)], axis=1, name='concat_basis'), (-1,6), name="concat_reshape"))
+
 
       sq_diff = tf.square(tf.subtract(expand_basis(labels), expand_basis(output)))
 
@@ -357,31 +321,61 @@ class DCGAN(object):
 
       W_diff2 = tf.Variable(tf.truncated_normal([10, 1]))
       b_diff2 = tf.Variable(tf.truncated_normal([1, 1]))
-      fc_diff2 = tf.nn.sigmoid(tf.matmul(fc_diff1, W_diff2) + b_diff2)
+      fc_diff2 = tf.matmul(fc_diff1, W_diff2) + b_diff2
 
       print("fc_diff2")
       print(fc_diff2)
 
       return(fc_diff2)
+      """
+      
 
-  def generator(self):
+  def generator(self, x, reuse=False):
     n_layers = self.n_layers
     S = self.S
     B = self.B
     L_list = self.L_list
     p = self.p
-    x = self.x 
     with tf.variable_scope("generator") as scope:
+      if reuse:
+        scope.reuse_variables()
 
+      x = tf.reshape(x, (-1,p))
+
+      W0 = tf.Variable(tf.random_normal([p, 200]))
+      b0 = tf.Variable(tf.zeros([1, 200]))
+
+      h0 = tf.nn.softplus(tf.matmul(x, W0) + b0)
+
+      #h0 = tf.add(h0, z)
+
+      W1 = tf.Variable(tf.random_normal([200, 1]))
+      b1 = tf.Variable(tf.zeros([1, 1]))
+
+      h1 = tf.matmul(h0, W1) + b1
+
+      #W2 = tf.Variable(tf.random_normal([5, 1]))
+      #b2 = tf.Variable(tf.zeros([1, 1]))
+
+      #h2 = tf.matmul(h1, W2) + b2
+      #output = tf.abs(tf.atan(tf.sin(h1)/tf.cos(h1)))
+
+      print("gen.h1")
+      print(h1)
+
+      return(h1)
+    """
       W_list = [None for i in range(n_layers)]
       b_list = [None for i in range(n_layers)]
       h_list = [None for i in range(n_layers)]
 
       def adjacency_conv_layer(atom_matrix, W, b, L_in, L_out, layer_idx):
         print("layer_idx: %d" %(layer_idx))
-        h = tf.matmul(self.adj_matrix, atom_matrix)
+        h = tf.matmul(adj_matrix, atom_matrix)
         h = tf.reshape(h, shape=(S*B, L_in))
         h = tf.nn.sigmoid(tf.matmul(h, W) + b)
+        if layer_idx == 0:
+          h = tf.add(h, z)
         h = tf.reshape(h, (S, B, L_out))
 
         return(h)
@@ -396,7 +390,7 @@ class DCGAN(object):
           L_out = L_list[layer_idx]
           atom_matrix = h_list[layer_idx-1]
 
-        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out], seed=2017), name="W_list%d" %layer_idx)
+        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out]), name="W_list%d" %layer_idx)
         b_list[layer_idx] = tf.Variable(tf.ones([1, L_out]))
         h_list[layer_idx] = adjacency_conv_layer(atom_matrix, W_list[layer_idx], b_list[layer_idx], L_in, L_out, layer_idx)
 
@@ -410,11 +404,11 @@ class DCGAN(object):
         mol_tuple = []
         for j in range(0, 4):
           entry = h_final[i]
-          indices = self.dihed_indices[i][:,:,j]
+          indices = dihed_indices[i][:,:,j]
           atom_list = tf.matmul(indices, entry)
-          atom_list = tf.reshape(atom_list, (250, L_final))
+          atom_list = tf.reshape(atom_list, (25, L_final))
           mol_tuple.append(atom_list)
-        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (250, L_final*4))
+        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (25, L_final*4))
         d0.append(mol_tuple)
 
       d0 = tf.concat(d0, axis=0)
@@ -429,32 +423,51 @@ class DCGAN(object):
       d3 = tf.matmul(d2, W_d2) + b_d2
       d3_cos = tf.cos(d3)
       d3_sin = tf.sin(d3)
-      output = atan2(d3_sin, d3_cos)
+      output = tf.abs(atan2(d3_sin, d3_cos))
 
-      output = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), output)
+      #output = tf.matmul(tf.cast(non_zero_inds, tf.float32), output)
 
       return(output)
+    """
 
-  def sampler(self):
+  def sampler(self, x, adj_matrix, dihed_indices, non_zero_inds, z):
     n_layers = self.n_layers
     S = self.S
     B = self.B
     L_list = self.L_list
     p = self.p
-    x = self.x
     with tf.variable_scope("generator") as scope:
       scope.reuse_variables()
 
+      x = tf.reshape(x, (-1,75))
+
+      W0 = tf.Variable(tf.truncated_normal([p, 5]))
+      b0 = tf.Variable(tf.ones([1, 5]))
+
+      h0 = tf.nn.relu(tf.matmul(x, W0) + b0)
+
+      h0 = tf.add(h0, z)
+
+      W1 = tf.Variable(tf.truncated_normal([5, 1]))
+      b1 = tf.Variable(tf.ones([1, 1]))
+
+      h1 = tf.nn.relu(tf.matmul(h0, W1) + b1)
+      output = tf.atan(tf.sin(h1)/tf.cos(h1))
+
+      return(output)
+      """
+
       W_list = [None for i in range(n_layers)]
       b_list = [None for i in range(n_layers)]
       h_list = [None for i in range(n_layers)]
 
       def adjacency_conv_layer(atom_matrix, W, b, L_in, L_out, layer_idx):
         print("layer_idx: %d" %(layer_idx))
-        h = tf.matmul(self.adj_matrix, atom_matrix)
+        h = tf.matmul(adj_matrix, atom_matrix)
         h = tf.reshape(h, shape=(S*B, L_in))
-
         h = tf.nn.sigmoid(tf.matmul(h, W) + b)
+        if layer_idx == 0:
+          h = tf.add(h, z)
         h = tf.reshape(h, (S, B, L_out))
 
         return(h)
@@ -469,7 +482,7 @@ class DCGAN(object):
           L_out = L_list[layer_idx]
           atom_matrix = h_list[layer_idx-1]
 
-        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out], seed=2017), name="W_list%d" %layer_idx)
+        W_list[layer_idx] = tf.Variable(tf.truncated_normal([L_in, L_out]), name="W_list%d" %layer_idx)
         b_list[layer_idx] = tf.Variable(tf.ones([1, L_out]))
         h_list[layer_idx] = adjacency_conv_layer(atom_matrix, W_list[layer_idx], b_list[layer_idx], L_in, L_out, layer_idx)
 
@@ -483,11 +496,11 @@ class DCGAN(object):
         mol_tuple = []
         for j in range(0, 4):
           entry = h_final[i]
-          indices = self.dihed_indices[i][:,:,j]
+          indices = dihed_indices[i][:,:,j]
           atom_list = tf.matmul(indices, entry)
-          atom_list = tf.reshape(atom_list, (250, L_final))
+          atom_list = tf.reshape(atom_list, (25, L_final))
           mol_tuple.append(atom_list)
-        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (250, L_final*4))
+        mol_tuple = tf.reshape(tf.stack(mol_tuple, axis=1), (25, L_final*4))
         d0.append(mol_tuple)
 
       d0 = tf.concat(d0, axis=0)
@@ -502,42 +515,9 @@ class DCGAN(object):
       d3 = tf.matmul(d2, W_d2) + b_d2
       d3_cos = tf.cos(d3)
       d3_sin = tf.sin(d3)
-      output = atan2(d3_sin, d3_cos)
+      output = tf.abs(atan2(d3_sin, d3_cos))
 
-      output = tf.matmul(tf.cast(self.non_zero_inds, tf.float32), output)
+      #$output = tf.matmul(tf.cast(non_zero_inds, tf.float32), output)
 
       return(output)
-
-
-  @property
-  def model_dir(self):
-    return "{}_{}_{}_{}".format(
-        self.dataset_name, self.batch_size,
-        self.output_height, self.output_width)
-      
-  def save(self, checkpoint_dir, step):
-    model_name = "DCGAN.model"
-    checkpoint_dir = os.path.join(checkpoint_dir, self.model_dir)
-
-    if not os.path.exists(checkpoint_dir):
-      os.makedirs(checkpoint_dir)
-
-    self.saver.save(self.sess,
-            os.path.join(checkpoint_dir, model_name),
-            global_step=step)
-
-  def load(self, checkpoint_dir):
-    import re
-    print(" [*] Reading checkpoints...")
-    checkpoint_dir = os.path.join(checkpoint_dir, self.model_dir)
-
-    ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
-    if ckpt and ckpt.model_checkpoint_path:
-      ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
-      self.saver.restore(self.sess, os.path.join(checkpoint_dir, ckpt_name))
-      counter = int(next(re.finditer("(\d+)(?!.*\d)",ckpt_name)).group(0))
-      print(" [*] Success to read {}".format(ckpt_name))
-      return True, counter
-    else:
-      print(" [*] Failed to find a checkpoint")
-      return False, 0
+      """
